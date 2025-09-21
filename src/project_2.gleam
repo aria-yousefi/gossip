@@ -1,3 +1,4 @@
+import argv
 import gleam/erlang/process
 import gleam/int
 import gleam/io
@@ -7,25 +8,48 @@ import gleam/otp/actor
 // ===== Entry point =====
 
 pub fn main() -> Nil {
-  let n = 20
-  // smaller for easier output; bump to 1000 later
-  let rumor_id = "rumor-1"
-  let rumor_text = "Here's a rumor!"
+  let args = argv.load().arguments
+  let default_top = "full"
+  let default_n = 20
 
-  case initialize_full_topology(n) {
+  let top_str = case args {
+    [t, _n] -> t
+    [t] -> t
+    _ -> default_top
+  }
+
+  let n = case args {
+    [_t, n_str] -> {
+      case int.parse(n_str) {
+        Ok(v) -> v
+        Error(_) -> default_n
+      }
+    }
+    _ -> default_n
+  }
+
+  io.println("Topology: " <> top_str <> ", n = " <> int.to_string(n))
+
+  case initialize_topology(n, top_str) {
     Ok(subjects) -> {
       io.println("Topology ready. Seeding gossip...")
+      // Seed first actor (index 0) for visibility
       case subjects {
         [seed_subject, ..] -> {
           io.println("Seeding gossip into actor 0")
-          let _ = process.send(seed_subject, Gossip(rumor_id, rumor_text, -1))
+          let _ =
+            process.send(seed_subject, Gossip("rumor-1", "Here's a rumor!", -1))
           process.sleep(3000)
           // ms to let actors run
         }
         [] -> io.println("No seed found!")
       }
     }
-    Error(_) -> io.println("Failed to initialize topology!")
+    Error(_) -> {
+      io.println(
+        "Failed to initialize topology!\n\nUsage: gleam run <full|line|grid3d|imperfect3d> <n>",
+      )
+    }
   }
 }
 
@@ -60,7 +84,13 @@ fn actor_handler(
 ) -> actor.Next(ActorState, Message) {
   case message {
     SetupPeers(peers) -> {
-      io.println("Actor " <> int.to_string(state.id) <> " received peers list")
+      io.println(
+        "Actor "
+        <> int.to_string(state.id)
+        <> " received peers list ("
+        <> int.to_string(list.length(peers))
+        <> " neighbors)",
+      )
       let new_state = ActorState(..state, peers: peers)
       actor.continue(new_state)
     }
@@ -123,6 +153,7 @@ fn actor_handler(
 
 // ===== Helper functions =====
 
+// Simple list membership check
 fn contains(list: List(String), value: String) -> Bool {
   case list {
     [] -> False
@@ -130,6 +161,7 @@ fn contains(list: List(String), value: String) -> Bool {
   }
 }
 
+// Forward to all peers except self
 fn forward_to_peers(self_id: Int, peers: List(Peer), msg_id: String) -> Nil {
   let _ =
     peers
@@ -144,10 +176,11 @@ fn forward_to_peers(self_id: Int, peers: List(Peer), msg_id: String) -> Nil {
   Nil
 }
 
-// ===== Topology creation =====
+// ===== Topology creation (now supports multiple topologies) =====
 
-pub fn initialize_full_topology(
+pub fn initialize_topology(
   n: Int,
+  topology: String,
 ) -> Result(List(process.Subject(Message)), Nil) {
   case n > 0 {
     False -> {
@@ -157,6 +190,36 @@ pub fn initialize_full_topology(
     True -> {
       let subjects_with_ids = create_actors(n, 0, [])
 
+      // Build neighbor lists per actor, depending on the topology
+      let neighbor_lists = case topology {
+        "full" -> build_full(subjects_with_ids)
+        "line" -> build_line(subjects_with_ids)
+        "grid3d" -> build_grid3d(subjects_with_ids, n)
+        "imperfect3d" -> build_imperfect3d(subjects_with_ids, n)
+        _ -> {
+          io.println(
+            "Unknown topology \"" <> topology <> "\"; defaulting to full.",
+          )
+          build_full(subjects_with_ids)
+        }
+      }
+
+      // Send neighbors to each actor
+      let _ =
+        neighbor_lists
+        |> list.each(fn(entry) {
+          // entry: (id, subject, neighbors)
+          let TopoEntry(id, subject, neighbors) = entry
+          io.println(
+            "Assigning "
+            <> int.to_string(list.length(neighbors))
+            <> " neighbors to actor "
+            <> int.to_string(id),
+          )
+          process.send(subject, SetupPeers(neighbors))
+        })
+
+      // Return subjects list for seeding
       let subjects =
         subjects_with_ids
         |> list.map(fn(peer) {
@@ -164,18 +227,12 @@ pub fn initialize_full_topology(
           s
         })
 
-      let _ =
-        subjects_with_ids
-        |> list.each(fn(peer) {
-          let Peer(_, s) = peer
-          process.send(s, SetupPeers(subjects_with_ids))
-        })
-
       Ok(subjects)
     }
   }
 }
 
+// Spawn actors and return Peer(id, subject)
 fn create_actors(remaining: Int, next_id: Int, acc: List(Peer)) -> List(Peer) {
   case remaining > 0 {
     False -> list.reverse(acc)
@@ -193,5 +250,207 @@ fn create_actors(remaining: Int, next_id: Int, acc: List(Peer)) -> List(Peer) {
       let peer = Peer(next_id, started.data)
       create_actors(remaining - 1, next_id + 1, [peer, ..acc])
     }
+  }
+}
+
+// A compact struct to carry (id, subject, neighbors) while configuring topology
+type TopoEntry {
+  TopoEntry(Int, process.Subject(Message), List(Peer))
+}
+
+// ===== Topology builders =====
+
+// FULL: everyone else is a neighbor
+fn build_full(nodes: List(Peer)) -> List(TopoEntry) {
+  nodes
+  |> list.map(fn(node) {
+    let Peer(id, subject) = node
+    let neighbors =
+      nodes
+      |> list.filter(fn(p) {
+        let Peer(other_id, _) = p
+        other_id != id
+      })
+    TopoEntry(id, subject, neighbors)
+  })
+}
+
+// LINE: i has neighbors i-1 and i+1 (bounds-checked)
+fn build_line(nodes: List(Peer)) -> List(TopoEntry) {
+  let total = list.length(nodes)
+
+  nodes
+  |> list.map(fn(node) {
+    let Peer(id, subject) = node
+    let left = id - 1
+    let right = id + 1
+
+    // Tuple match must use #(...)
+    let neighbors_ids = case #(left >= 0, right < total) {
+      #(True, True) -> [left, right]
+      #(True, False) -> [left]
+      #(False, True) -> [right]
+      #(False, False) -> []
+    }
+
+    let neighbors = neighbors_by_ids(nodes, neighbors_ids)
+    TopoEntry(id, subject, neighbors)
+  })
+}
+
+// GRID3D: 6-neighborhood in a LxLxL grid; we only use first n cells
+fn build_grid3d(nodes: List(Peer), n: Int) -> List(TopoEntry) {
+  let l = cube_side_for(n)
+  let total_cap = l * l * l
+
+  // Map id -> (x,y,z) within L^3
+  nodes
+  |> list.map(fn(node) {
+    let Peer(id, subject) = node
+    let coords = id_to_coords(id, l)
+    let neighbor_ids =
+      six_neighbors(coords, l)
+      |> list.filter(fn(idx) { idx < n })
+    // ignore cells beyond n
+    let neighbors = neighbors_by_ids(nodes, neighbor_ids)
+    TopoEntry(id, subject, neighbors)
+  })
+}
+
+// IMPERFECT3D: grid3d + 1 extra deterministic neighbor not already present
+fn build_imperfect3d(nodes: List(Peer), n: Int) -> List(TopoEntry) {
+  let base = build_grid3d(nodes, n)
+
+  base
+  |> list.map(fn(entry) {
+    let TopoEntry(id, subject, neighbors) = entry
+    // deterministic pseudo-random pick: (a * id + b) mod n
+    let pick0 = { id * 1_103_515_245 + 12_345 } |> abs_mod(n)
+    let pick1 = { pick0 + 1 } |> abs_mod(n)
+    let pick = pick_non_conflicting(id, [pick0, pick1], neighbors)
+
+    let extra = case pick {
+      Ok(pid) -> {
+        case peer_by_id(nodes, pid) {
+          Ok(p) -> [p]
+          Error(_) -> []
+        }
+      }
+      Error(_) -> []
+    }
+
+    let neighbors2 = list.append(neighbors, extra)
+    TopoEntry(id, subject, neighbors2)
+  })
+}
+
+// ===== Neighbor math helpers =====
+
+// Find a peer by id in a small list
+fn peer_by_id(nodes: List(Peer), id: Int) -> Result(Peer, Nil) {
+  case nodes {
+    [] -> Error(Nil)
+    [head, ..tail] -> {
+      let Peer(hid, _) = head
+      case hid == id {
+        True -> Ok(head)
+        False -> peer_by_id(tail, id)
+      }
+    }
+  }
+}
+
+fn neighbors_by_ids(nodes: List(Peer), ids: List(Int)) -> List(Peer) {
+  case ids {
+    [] -> []
+    [i, ..rest] ->
+      case peer_by_id(nodes, i) {
+        Ok(p) -> [p, ..neighbors_by_ids(nodes, rest)]
+        Error(_) -> neighbors_by_ids(nodes, rest)
+        // skip invalid
+      }
+  }
+}
+
+// Convert id -> (x,y,z) for side L
+fn id_to_coords(id: Int, l: Int) -> #(Int, Int, Int) {
+  let x = id % l
+  let y = { id / l } % l
+  let z = id / { l * l }
+  #(x, y, z)
+}
+
+// Convert (x,y,z) -> id
+fn coords_to_id(x: Int, y: Int, z: Int, l: Int) -> Int {
+  x + y * l + z * l * l
+}
+
+// Return the six neighbor indices inside the LxLxL box (no n limit here)
+fn six_neighbors(coords: #(Int, Int, Int), l: Int) -> List(Int) {
+  let #(x, y, z) = coords
+
+  let candidates = [
+    #(x - 1, y, z),
+    #(x + 1, y, z),
+    #(x, y - 1, z),
+    #(x, y + 1, z),
+    #(x, y, z - 1),
+    #(x, y, z + 1),
+  ]
+
+  candidates
+  |> list.filter(fn(p) {
+    let #(cx, cy, cz) = p
+    cx >= 0 && cy >= 0 && cz >= 0 && cx < l && cy < l && cz < l
+  })
+  |> list.map(fn(p) {
+    let #(cx, cy, cz) = p
+    coords_to_id(cx, cy, cz, l)
+  })
+}
+
+// Choose L such that L^3 >= n and (L-1)^3 < n
+fn cube_side_for(n: Int) -> Int {
+  let mut = cube_side_loop(1, n)
+  mut
+}
+
+fn cube_side_loop(l: Int, n: Int) -> Int {
+  case l * l * l >= n {
+    True -> l
+    False -> cube_side_loop(l + 1, n)
+  }
+}
+
+fn abs_mod(x: Int, m: Int) -> Int {
+  let r = x % m
+  case r < 0 {
+    True -> r + m
+    False -> r
+  }
+}
+
+// Ensure extra neighbor is not self nor already a neighbor; try candidates in order
+fn pick_non_conflicting(
+  self_id: Int,
+  candidates: List(Int),
+  neighbors: List(Peer),
+) -> Result(Int, Nil) {
+  case candidates {
+    [] -> Error(Nil)
+    [cand, ..rest] -> {
+      case cand == self_id || peer_id_in_list(neighbors, cand) {
+        True -> pick_non_conflicting(self_id, rest, neighbors)
+        False -> Ok(cand)
+      }
+    }
+  }
+}
+
+fn peer_id_in_list(neighbors: List(Peer), target_id: Int) -> Bool {
+  case neighbors {
+    [] -> False
+    [Peer(hid, _), ..tail] ->
+      hid == target_id || peer_id_in_list(tail, target_id)
   }
 }
