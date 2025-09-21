@@ -3,6 +3,7 @@ import gleam/erlang/process
 import gleam/int
 import gleam/io
 import gleam/list
+import gleam/option
 import gleam/otp/actor
 
 // ===== Entry point =====
@@ -33,14 +34,39 @@ pub fn main() -> Nil {
   case initialize_topology(n, top_str) {
     Ok(subjects) -> {
       io.println("Topology ready. Seeding gossip...")
+
+      // Create a subject for the main process to receive completion signal
+      let main_subject = process.new_subject()
+
+      // Create coordinator
+      let coordinator_state =
+        CoordinatorState(
+          total_actors: n,
+          completed_actors: [],
+          main_subject: main_subject,
+        )
+
+      let assert Ok(coordinator) =
+        actor.new(coordinator_state)
+        |> actor.on_message(coordinator_handler)
+        |> actor.start
+
+      // Send coordinator reference to all actors
+      let _ =
+        subjects
+        |> list.each(fn(subject) {
+          process.send(subject, CoordinatorReady(coordinator.data))
+        })
+
       // Seed first actor (index 0) for visibility
       case subjects {
         [seed_subject, ..] -> {
           io.println("Seeding gossip into actor 0")
           let _ =
             process.send(seed_subject, Gossip("rumor-1", "Here's a rumor!", -1))
-          process.sleep(3000)
-          // ms to let actors run
+
+          // Wait for coordinator to signal completion
+          wait_for_completion(main_subject)
         }
         [] -> io.println("No seed found!")
       }
@@ -62,6 +88,12 @@ pub type Peer {
 pub type Message {
   Gossip(String, String, Int)
   SetupPeers(List(Peer))
+  ActorCompleted(Int)
+  // Actor reports completion
+  CoordinatorReady(process.Subject(Message))
+  // Coordinator announces itself
+  AllDone
+  // Coordinator signals completion
 }
 
 // ===== Internal actor state =====
@@ -72,8 +104,59 @@ type ActorState {
     times_heard: Int,
     peers: List(Peer),
     seen_ids: List(String),
-    // dedupe list
+    coordinator: option.Option(process.Subject(Message)),
+    // Reference to coordinator
   )
+}
+
+// ===== Coordinator state =====
+
+type CoordinatorState {
+  CoordinatorState(
+    total_actors: Int,
+    completed_actors: List(Int),
+    main_subject: process.Subject(Message),
+    // Reference to main process
+  )
+}
+
+// ===== Coordinator handler =====
+
+fn coordinator_handler(
+  state: CoordinatorState,
+  message: Message,
+) -> actor.Next(CoordinatorState, Message) {
+  case message {
+    ActorCompleted(actor_id) -> {
+      let CoordinatorState(total, completed, main) = state
+      let new_completed = [actor_id, ..completed]
+      let completed_count = list.length(new_completed)
+
+      io.println(
+        "Actor "
+        <> int.to_string(actor_id)
+        <> " completed. Progress: "
+        <> int.to_string(completed_count)
+        <> "/"
+        <> int.to_string(total),
+      )
+
+      case completed_count >= total {
+        True -> {
+          io.println("All actors have completed! Gossip protocol finished.")
+          // Notify main process that we're done
+          process.send(main, AllDone)
+          actor.stop()
+        }
+        False -> {
+          let new_state = CoordinatorState(total, new_completed, main)
+          actor.continue(new_state)
+        }
+      }
+    }
+
+    _ -> actor.continue(state)
+  }
 }
 
 // ===== Actor handler =====
@@ -83,6 +166,12 @@ fn actor_handler(
   message: Message,
 ) -> actor.Next(ActorState, Message) {
   case message {
+    CoordinatorReady(coord_subject) -> {
+      let new_state =
+        ActorState(..state, coordinator: option.Some(coord_subject))
+      actor.continue(new_state)
+    }
+
     SetupPeers(peers) -> {
       io.println(
         "Actor "
@@ -141,6 +230,13 @@ fn actor_handler(
                 <> int.to_string(state.id)
                 <> " heard rumor 3 times, stopping.",
               )
+              // Notify coordinator of completion
+              case state.coordinator {
+                option.Some(coord_subject) -> {
+                  process.send(coord_subject, ActorCompleted(state.id))
+                }
+                option.None -> Nil
+              }
               actor.stop()
             }
             False -> actor.continue(updated)
@@ -148,6 +244,11 @@ fn actor_handler(
         }
       }
     }
+
+    ActorCompleted(_) -> actor.continue(state)
+    // Ignore completion messages in actors
+    AllDone -> actor.continue(state)
+    // Ignore completion signals in actors
   }
 }
 
@@ -238,7 +339,14 @@ fn create_actors(remaining: Int, next_id: Int, acc: List(Peer)) -> List(Peer) {
     False -> list.reverse(acc)
     True -> {
       let init_state =
-        ActorState(id: next_id, times_heard: 0, peers: [], seen_ids: [])
+        ActorState(
+          id: next_id,
+          times_heard: 0,
+          peers: [],
+          seen_ids: [],
+          coordinator: option.None,
+          // Will be set later
+        )
 
       let assert Ok(started) =
         actor.new(init_state)
@@ -285,12 +393,12 @@ fn build_line(nodes: List(Peer)) -> List(TopoEntry) {
     let left = id - 1
     let right = id + 1
 
-    // Tuple match must use #(...)
-    let neighbors_ids = case #(left >= 0, right < total) {
-      #(True, True) -> [left, right]
-      #(True, False) -> [left]
-      #(False, True) -> [right]
-      #(False, False) -> []
+    // Multiple subjects in case expression
+    let neighbors_ids = case left >= 0, right < total {
+      True, True -> [left, right]
+      True, False -> [left]
+      False, True -> [right]
+      False, False -> []
     }
 
     let neighbors = neighbors_by_ids(nodes, neighbors_ids)
@@ -301,7 +409,6 @@ fn build_line(nodes: List(Peer)) -> List(TopoEntry) {
 // GRID3D: 6-neighborhood in a LxLxL grid; we only use first n cells
 fn build_grid3d(nodes: List(Peer), n: Int) -> List(TopoEntry) {
   let l = cube_side_for(n)
-  let total_cap = l * l * l
 
   // Map id -> (x,y,z) within L^3
   nodes
@@ -452,5 +559,22 @@ fn peer_id_in_list(neighbors: List(Peer), target_id: Int) -> Bool {
     [] -> False
     [Peer(hid, _), ..tail] ->
       hid == target_id || peer_id_in_list(tail, target_id)
+  }
+}
+
+// ===== Wait for completion =====
+
+fn wait_for_completion(main_subject: process.Subject(Message)) -> Nil {
+  // This will block until the coordinator sends us a message
+  let message = process.receive_forever(main_subject)
+  case message {
+    AllDone -> {
+      io.println("Received completion signal from coordinator.")
+      Nil
+    }
+    _ -> {
+      io.println("Unexpected message received.")
+      Nil
+    }
   }
 }
