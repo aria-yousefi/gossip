@@ -25,21 +25,14 @@ pub fn main() -> Nil {
   let default_n = 20
   let default_algorithm = "gossip"
 
-  let top_str = case args {
-    [t, _n, _alg] -> t
-    [t, _n] -> t
-    [t] -> t
-    _ -> default_top
-  }
-
   let n = case args {
-    [_t, n_str, _alg] -> {
+    [n_str, _t, _alg] -> {
       case int.parse(n_str) {
         Ok(v) -> v
         Error(_) -> default_n
       }
     }
-    [_t, n_str] -> {
+    [n_str, _t] -> {
       case int.parse(n_str) {
         Ok(v) -> v
         Error(_) -> default_n
@@ -48,8 +41,16 @@ pub fn main() -> Nil {
     _ -> default_n
   }
 
+  let top_str = case args {
+    [_n, t, _alg] -> t
+    [_n, t] -> t
+    [t] -> t
+    _ -> default_top
+  }
+
+
   let algorithm_str = case args {
-    [_t, _n, alg] -> alg
+    [_n, _t,  alg] -> alg
     _ -> default_algorithm
   }
 
