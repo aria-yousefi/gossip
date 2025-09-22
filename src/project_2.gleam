@@ -1,10 +1,13 @@
 import argv
+import gleam/bool
 import gleam/erlang/process
+import gleam/float
 import gleam/int
 import gleam/io
 import gleam/list
 import gleam/option
 import gleam/otp/actor
+import gleam/string
 
 // ===== Entry point =====
 
@@ -12,14 +15,22 @@ pub fn main() -> Nil {
   let args = argv.load().arguments
   let default_top = "full"
   let default_n = 20
+  let default_algorithm = "gossip"
 
   let top_str = case args {
+    [t, _n, _alg] -> t
     [t, _n] -> t
     [t] -> t
     _ -> default_top
   }
 
   let n = case args {
+    [_t, n_str, _alg] -> {
+      case int.parse(n_str) {
+        Ok(v) -> v
+        Error(_) -> default_n
+      }
+    }
     [_t, n_str] -> {
       case int.parse(n_str) {
         Ok(v) -> v
@@ -29,11 +40,28 @@ pub fn main() -> Nil {
     _ -> default_n
   }
 
-  io.println("Topology: " <> top_str <> ", n = " <> int.to_string(n))
+  let algorithm_str = case args {
+    [_t, _n, alg] -> alg
+    _ -> default_algorithm
+  }
 
-  case initialize_topology(n, top_str) {
+  let algorithm = case algorithm_str {
+    "push-sum" -> PushSumAlgorithm
+    _ -> GossipAlgorithm
+  }
+
+  io.println(
+    "Topology: "
+    <> top_str
+    <> ", n = "
+    <> int.to_string(n)
+    <> ", algorithm: "
+    <> algorithm_str,
+  )
+
+  case initialize_topology(n, top_str, algorithm) {
     Ok(subjects) -> {
-      io.println("Topology ready. Seeding gossip...")
+      io.println("Topology ready. Seeding algorithm...")
 
       // Create a subject for the main process to receive completion signal
       let main_subject = process.new_subject()
@@ -58,12 +86,23 @@ pub fn main() -> Nil {
           process.send(subject, CoordinatorReady(coordinator.data))
         })
 
-      // Seed first actor (index 0) for visibility
+      // Start the algorithm
       case subjects {
         [seed_subject, ..] -> {
-          io.println("Seeding gossip into actor 0")
-          let _ =
-            process.send(seed_subject, Gossip("rumor-1", "Here's a rumor!", -1))
+          case algorithm {
+            GossipAlgorithm -> {
+              io.println("Seeding gossip into actor 0")
+              let _ =
+                process.send(
+                  seed_subject,
+                  Gossip("rumor-1", "Here's a rumor!", -1),
+                )
+            }
+            PushSumAlgorithm -> {
+              io.println("Starting push-sum algorithm with actor 0")
+              let _ = process.send(seed_subject, PushSum(1.0, 1.0))
+            }
+          }
 
           // Wait for coordinator to signal completion
           wait_for_completion(main_subject)
@@ -73,7 +112,7 @@ pub fn main() -> Nil {
     }
     Error(_) -> {
       io.println(
-        "Failed to initialize topology!\n\nUsage: gleam run <full|line|grid3d|imperfect3d> <n>",
+        "Failed to initialize topology!\n\nUsage: gleam run <full|line|grid3d|imperfect3d> <n> <gossip|push-sum>",
       )
     }
   }
@@ -89,11 +128,20 @@ pub type Message {
   Gossip(String, String, Int)
   SetupPeers(List(Peer))
   ActorCompleted(Int)
-  // Actor reports completion
   CoordinatorReady(process.Subject(Message))
-  // Coordinator announces itself
+  // message to inform all actors have completed execution, I did this to avoid using process.sleep() or similar manual mechanisms to let program flow continue until execution completes
   AllDone
-  // Coordinator signals completion
+  PushSum(Float, Float)
+  // Push-sum message with (s, w) values
+  // StartPushSum
+  // Signal to start push-sum algorithm
+}
+
+// ===== Algorithm types =====
+
+pub type Algorithm {
+  GossipAlgorithm
+  PushSumAlgorithm
 }
 
 // ===== Internal actor state =====
@@ -105,7 +153,11 @@ type ActorState {
     peers: List(Peer),
     seen_ids: List(String),
     coordinator: option.Option(process.Subject(Message)),
-    // Reference to coordinator
+    algorithm: Algorithm,
+    s: Float,
+    w: Float,
+    last_ratios: List(Float),
+    converged: Bool,
   )
 }
 
@@ -143,7 +195,9 @@ fn coordinator_handler(
 
       case completed_count >= total {
         True -> {
-          io.println("All actors have completed! Gossip protocol finished.")
+          io.println(
+            "All actors have completed! Gossip protocol/Push-sum finished.",
+          )
           // Notify main process that we're done
           process.send(main, AllDone)
           actor.stop()
@@ -248,7 +302,142 @@ fn actor_handler(
     ActorCompleted(_) -> actor.continue(state)
     // Ignore completion messages in actors
     AllDone -> actor.continue(state)
-    // Ignore completion signals in actors
+
+    PushSum(received_s, received_w) -> {
+  case state.converged {
+    True -> {
+      // Passive mode: forward entire received to random neighbor
+      case state.peers {
+        [] -> {
+          io.println("Actor " <> int.to_string(state.id) <> " (passive) has no peers to forward to!")
+          actor.continue(state)
+        }
+        peers -> {
+          let neighbor_index = int.random(list.length(peers))
+          let selected_peer = get_peer_at_index(peers, neighbor_index)
+          case selected_peer {
+            Ok(Peer(neighbor_id, subject)) -> {
+              io.println(
+                "Actor "
+                <> int.to_string(state.id)
+                <> " (passive) forwarding ("
+                <> float.to_string(received_s)
+                <> ", "
+                <> float.to_string(received_w)
+                <> ") to neighbor "
+                <> int.to_string(neighbor_id),
+              )
+              process.send(subject, PushSum(received_s, received_w))
+            }
+            Error(_) -> {
+              io.println("Actor " <> int.to_string(state.id) <> " (passive) failed to select neighbor")
+            }
+          }
+          actor.continue(state)
+        }
+      }
+    }
+    False -> {
+      // Active mode: add received, update, check termination
+      let new_s = state.s +. received_s
+      let new_w = state.w +. received_w
+      let current_ratio = new_s /. new_w
+
+      let new_ratios = case list.length(state.last_ratios) >= 3 {
+        True -> list.drop(state.last_ratios, 1) |> list.append([current_ratio])
+        False -> list.append(state.last_ratios, [current_ratio])
+      }
+
+      let updated_state = ActorState(..state, s: new_s, w: new_w, last_ratios: new_ratios)
+
+      case should_terminate_pushsum(new_ratios) {
+        True -> {
+          io.println(
+            "Actor "
+            <> int.to_string(state.id)
+            <> " converging push-sum. Final ratio: "
+            <> float.to_string(current_ratio),
+          )
+          // Notify coordinator
+          case state.coordinator {
+            option.Some(coord_subject) -> process.send(coord_subject, ActorCompleted(state.id))
+            option.None -> Nil
+          }
+          // Offload full current mass to random neighbor
+          case state.peers {
+            [] -> {
+              io.println("Actor " <> int.to_string(state.id) <> " has no peers to offload to!")
+              actor.continue(ActorState(..updated_state, converged: True, s: 0.0, w: 0.0, last_ratios: []))
+            }
+            peers -> {
+              let neighbor_index = int.random(list.length(peers))
+              let selected_peer = get_peer_at_index(peers, neighbor_index)
+              case selected_peer {
+                Ok(Peer(neighbor_id, subject)) -> {
+                  io.println(
+                    "Actor "
+                    <> int.to_string(state.id)
+                    <> " offloading full ("
+                    <> float.to_string(new_s)
+                    <> ", "
+                    <> float.to_string(new_w)
+                    <> ") to neighbor "
+                    <> int.to_string(neighbor_id),
+                  )
+                  process.send(subject, PushSum(new_s, new_w))
+                }
+                Error(_) -> {
+                  io.println("Actor " <> int.to_string(state.id) <> " failed to select neighbor for offload")
+                }
+              }
+              // Become passive with zero mass
+              actor.continue(ActorState(..updated_state, converged: True, s: 0.0, w: 0.0, last_ratios: []))
+            }
+          }
+        }
+        False -> {
+          // Normal: send half, keep half
+          let half_s = new_s /. 2.0
+          let half_w = new_w /. 2.0
+          let final_s = new_s -. half_s
+          let final_w = new_w -. half_w
+
+          let final_state = ActorState(..updated_state, s: final_s, w: final_w)
+
+          case state.peers {
+            [] -> {
+              io.println("Actor " <> int.to_string(state.id) <> " has no peers!")
+              actor.continue(final_state)
+            }
+            peers -> {
+              let neighbor_index = int.random(list.length(peers))
+              let selected_peer = get_peer_at_index(peers, neighbor_index)
+              case selected_peer {
+                Ok(Peer(neighbor_id, subject)) -> {
+                  io.println(
+                    "Actor "
+                    <> int.to_string(state.id)
+                    <> " sending ("
+                    <> float.to_string(half_s)
+                    <> ", "
+                    <> float.to_string(half_w)
+                    <> ") to neighbor "
+                    <> int.to_string(neighbor_id),
+                  )
+                  process.send(subject, PushSum(half_s, half_w))
+                }
+                Error(_) -> {
+                  io.println("Actor " <> int.to_string(state.id) <> " failed to select neighbor")
+                }
+              }
+              actor.continue(final_state)
+            }
+          }
+        }
+      }
+    }
+  }
+}
   }
 }
 
@@ -259,6 +448,53 @@ fn contains(list: List(String), value: String) -> Bool {
   case list {
     [] -> False
     [head, ..tail] -> head == value || contains(tail, value)
+  }
+}
+
+// Check if push-sum should terminate based on ratio stability
+fn should_terminate_pushsum(ratios: List(Float)) -> Bool {
+  case list.length(ratios) >= 3 {
+    True -> {
+      case ratios {
+        [r1, r2, r3, ..] -> {
+          // Check if the ratio hasn't changed by more than 10^-10 over 3 consecutive rounds
+          let diff1 = float.absolute_value(r1 -. r2)
+          let diff2 = float.absolute_value(r2 -. r3)
+          let should_terminate = diff1 <. 0.0000000001 && diff2 <. 0.0000000001
+
+          io.println(
+            "Termination check: r1="
+            <> float.to_string(r1)
+            <> ", r2="
+            <> float.to_string(r2)
+            <> ", r3="
+            <> float.to_string(r3)
+            <> ", diff1="
+            <> float.to_string(diff1)
+            <> ", diff2="
+            <> float.to_string(diff2)
+            <> ", terminate="
+            <> bool.to_string(should_terminate),
+          )
+
+          should_terminate
+        }
+        _ -> False
+      }
+    }
+    False -> False
+  }
+}
+
+fn get_peer_at_index(peers: List(Peer), index: Int) -> Result(Peer, Nil) {
+  case peers {
+    [] -> Error(Nil)
+    [peer, ..rest] -> {
+      case index {
+        0 -> Ok(peer)
+        _ -> get_peer_at_index(rest, index - 1)
+      }
+    }
   }
 }
 
@@ -282,6 +518,7 @@ fn forward_to_peers(self_id: Int, peers: List(Peer), msg_id: String) -> Nil {
 pub fn initialize_topology(
   n: Int,
   topology: String,
+  algorithm: Algorithm,
 ) -> Result(List(process.Subject(Message)), Nil) {
   case n > 0 {
     False -> {
@@ -289,7 +526,7 @@ pub fn initialize_topology(
       Error(Nil)
     }
     True -> {
-      let subjects_with_ids = create_actors(n, 0, [])
+      let subjects_with_ids = create_actors(n, 0, [], algorithm)
 
       // Build neighbor lists per actor, depending on the topology
       let neighbor_lists = case topology {
@@ -334,7 +571,12 @@ pub fn initialize_topology(
 }
 
 // Spawn actors and return Peer(id, subject)
-fn create_actors(remaining: Int, next_id: Int, acc: List(Peer)) -> List(Peer) {
+fn create_actors(
+  remaining: Int,
+  next_id: Int,
+  acc: List(Peer),
+  algorithm: Algorithm,
+) -> List(Peer) {
   case remaining > 0 {
     False -> list.reverse(acc)
     True -> {
@@ -345,7 +587,11 @@ fn create_actors(remaining: Int, next_id: Int, acc: List(Peer)) -> List(Peer) {
           peers: [],
           seen_ids: [],
           coordinator: option.None,
-          // Will be set later
+          algorithm: algorithm,
+          s: int.to_float(next_id + 1),  // Optional: start IDs from 1 to n for standard sum/avg; avoids s=0.0 for actor 0
+          w: 1.0,
+          last_ratios: [],
+          converged: False,  // Initialize
         )
 
       let assert Ok(started) =
@@ -356,7 +602,7 @@ fn create_actors(remaining: Int, next_id: Int, acc: List(Peer)) -> List(Peer) {
       io.println("Actor " <> int.to_string(next_id) <> " created")
 
       let peer = Peer(next_id, started.data)
-      create_actors(remaining - 1, next_id + 1, [peer, ..acc])
+      create_actors(remaining - 1, next_id + 1, [peer, ..acc], algorithm)
     }
   }
 }
