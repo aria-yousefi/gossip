@@ -1,5 +1,5 @@
 import argv
-import gleam/bool
+import gleam/erlang/atom
 import gleam/erlang/process
 import gleam/float
 import gleam/int
@@ -7,9 +7,17 @@ import gleam/io
 import gleam/list
 import gleam/option
 import gleam/otp/actor
-import gleam/string
 
-// ===== Entry point =====
+@external(erlang, "erlang", "statistics")
+pub fn statistics(which: atom.Atom) -> #(Int, Int)
+
+@external(erlang, "erlang", "system_info")
+pub fn system_info(which: atom.Atom) -> Int
+
+fn wall_time_ms() -> Int {
+  let #(time, _) = statistics(atom.create("wall_clock"))
+  time
+}
 
 pub fn main() -> Nil {
   let args = argv.load().arguments
@@ -17,21 +25,14 @@ pub fn main() -> Nil {
   let default_n = 20
   let default_algorithm = "gossip"
 
-  let top_str = case args {
-    [t, _n, _alg] -> t
-    [t, _n] -> t
-    [t] -> t
-    _ -> default_top
-  }
-
   let n = case args {
-    [_t, n_str, _alg] -> {
+    [n_str, _t, _alg] -> {
       case int.parse(n_str) {
         Ok(v) -> v
         Error(_) -> default_n
       }
     }
-    [_t, n_str] -> {
+    [n_str, _t] -> {
       case int.parse(n_str) {
         Ok(v) -> v
         Error(_) -> default_n
@@ -40,8 +41,16 @@ pub fn main() -> Nil {
     _ -> default_n
   }
 
+  let top_str = case args {
+    [_n, t, _alg] -> t
+    [_n, t] -> t
+    [t] -> t
+    _ -> default_top
+  }
+
+
   let algorithm_str = case args {
-    [_t, _n, alg] -> alg
+    [_n, _t,  alg] -> alg
     _ -> default_algorithm
   }
 
@@ -50,28 +59,17 @@ pub fn main() -> Nil {
     _ -> GossipAlgorithm
   }
 
-  io.println(
-    "Topology: "
-    <> top_str
-    <> ", n = "
-    <> int.to_string(n)
-    <> ", algorithm: "
-    <> algorithm_str,
-  )
-
   case initialize_topology(n, top_str, algorithm) {
     Ok(subjects) -> {
-      io.println("Topology ready. Seeding algorithm...")
-
-      // Create a subject for the main process to receive completion signal
+      let start_actual_time = wall_time_ms()
       let main_subject = process.new_subject()
 
-      // Create coordinator
       let coordinator_state =
         CoordinatorState(
           total_actors: n,
           completed_actors: [],
           main_subject: main_subject,
+          actors: subjects,
         )
 
       let assert Ok(coordinator) =
@@ -79,19 +77,17 @@ pub fn main() -> Nil {
         |> actor.on_message(coordinator_handler)
         |> actor.start
 
-      // Send coordinator reference to all actors
       let _ =
         subjects
         |> list.each(fn(subject) {
           process.send(subject, CoordinatorReady(coordinator.data))
         })
 
-      // Start the algorithm
+      // Start the algorithm execution for Gossip or PushSum
       case subjects {
         [seed_subject, ..] -> {
           case algorithm {
             GossipAlgorithm -> {
-              io.println("Seeding gossip into actor 0")
               let _ =
                 process.send(
                   seed_subject,
@@ -99,13 +95,16 @@ pub fn main() -> Nil {
                 )
             }
             PushSumAlgorithm -> {
-              io.println("Starting push-sum algorithm with actor 0")
               let _ = process.send(seed_subject, PushSum(1.0, 1.0))
             }
           }
 
-          // Wait for coordinator to signal completion
           wait_for_completion(main_subject)
+          let end_actual_time = wall_time_ms()
+          let actual_delta = end_actual_time - start_actual_time
+          io.println(
+            "Convergence completed in: " <> int.to_string(actual_delta) <> "ms",
+          )
         }
         [] -> io.println("No seed found!")
       }
@@ -118,8 +117,7 @@ pub fn main() -> Nil {
   }
 }
 
-// ===== Messages & public types =====
-
+// This is a type for each actor's neighbor
 pub type Peer {
   Peer(Int, process.Subject(Message))
 }
@@ -129,81 +127,64 @@ pub type Message {
   SetupPeers(List(Peer))
   ActorCompleted(Int)
   CoordinatorReady(process.Subject(Message))
-  // message to inform all actors have completed execution, I did this to avoid using process.sleep() or similar manual mechanisms to let program flow continue until execution completes
   AllDone
   PushSum(Float, Float)
-  // Push-sum message with (s, w) values
-  // StartPushSum
-  // Signal to start push-sum algorithm
 }
 
-// ===== Algorithm types =====
-
+// As per project spec, these are the 2 algorithms which will be used by main() after parsing input
 pub type Algorithm {
   GossipAlgorithm
   PushSumAlgorithm
 }
 
-// ===== Internal actor state =====
-
+// Common state variables for both gossip and push-sum actors
 type ActorState {
   ActorState(
     id: Int,
     times_heard: Int,
     peers: List(Peer),
-    seen_ids: List(String),
     coordinator: option.Option(process.Subject(Message)),
     algorithm: Algorithm,
     s: Float,
     w: Float,
     last_ratios: List(Float),
     converged: Bool,
+    has_forwarded: Bool,
   )
 }
 
-// ===== Coordinator state =====
-
+// Coordinator to do 2 things: 1) Seed a rumor, 2) Wait for convergence of all actors in each algorithm
 type CoordinatorState {
   CoordinatorState(
     total_actors: Int,
     completed_actors: List(Int),
     main_subject: process.Subject(Message),
-    // Reference to main process
+    actors: List(process.Subject(Message)),
   )
 }
 
-// ===== Coordinator handler =====
-
+// Coordinator handler waits for AllDone message to exit main program. This wait continues until number of 'ActorCompleted' messages received is equal to the number of actors (shows ActorCompleted is sent when actor is converged)  
 fn coordinator_handler(
   state: CoordinatorState,
   message: Message,
 ) -> actor.Next(CoordinatorState, Message) {
   case message {
     ActorCompleted(actor_id) -> {
-      let CoordinatorState(total, completed, main) = state
+      let CoordinatorState(total, completed, main, actors) = state
       let new_completed = [actor_id, ..completed]
       let completed_count = list.length(new_completed)
 
-      io.println(
-        "Actor "
-        <> int.to_string(actor_id)
-        <> " completed. Progress: "
-        <> int.to_string(completed_count)
-        <> "/"
-        <> int.to_string(total),
-      )
-
       case completed_count >= total {
         True -> {
-          io.println(
-            "All actors have completed! Gossip protocol/Push-sum finished.",
-          )
-          // Notify main process that we're done
           process.send(main, AllDone)
+          let _ =
+            list.each(actors, fn(actor_subject) {
+              process.send(actor_subject, AllDone)
+            })
           actor.stop()
         }
         False -> {
-          let new_state = CoordinatorState(total, new_completed, main)
+          let new_state = CoordinatorState(total, new_completed, main, actors)
           actor.continue(new_state)
         }
       }
@@ -213,7 +194,18 @@ fn coordinator_handler(
   }
 }
 
-// ===== Actor handler =====
+fn wait_for_completion(main_subject: process.Subject(Message)) -> Nil {
+  let message = process.receive_forever(main_subject)
+  case message {
+    AllDone -> {
+      Nil
+    }
+    _ -> {
+      io.println("Unexpected message received.")
+      Nil
+    }
+  }
+}
 
 fn actor_handler(
   state: ActorState,
@@ -227,256 +219,232 @@ fn actor_handler(
     }
 
     SetupPeers(peers) -> {
-      io.println(
-        "Actor "
-        <> int.to_string(state.id)
-        <> " received peers list ("
-        <> int.to_string(list.length(peers))
-        <> " neighbors)",
-      )
       let new_state = ActorState(..state, peers: peers)
       actor.continue(new_state)
     }
 
-    Gossip(msg_id, _text, sender_id) -> {
-      case state.times_heard >= 3 {
-        True -> actor.stop()
-        False -> {
-          let new_times = state.times_heard + 1
-          io.println(
-            "Actor "
-            <> int.to_string(state.id)
-            <> " heard rumor "
-            <> msg_id
-            <> " from "
-            <> int.to_string(sender_id)
-            <> " ["
-            <> int.to_string(new_times)
-            <> "/3]",
-          )
-
-          let already_forwarded = contains(state.seen_ids, msg_id)
-          let new_seen_ids = case already_forwarded {
-            True -> state.seen_ids
-            False -> [msg_id, ..state.seen_ids]
-          }
-
-          let _ = case already_forwarded {
-            True -> Nil
-            False -> {
-              io.println(
-                "Actor "
-                <> int.to_string(state.id)
-                <> " forwarding rumor "
-                <> msg_id,
-              )
-              forward_to_peers(state.id, state.peers, msg_id)
+    Gossip(msg_id, _text, _sender_id) -> {
+      case state.converged {
+        True -> {
+          case state.peers {
+            [] -> {
+              actor.continue(state)
+            }
+            peers -> {
+              let neighbor_index = int.random(list.length(peers))
+              let selected_peer = get_peer_at_index(peers, neighbor_index)
+              case selected_peer {
+                Ok(Peer(_neighbor_id, subject)) -> {
+                  process.send(subject, Gossip(msg_id, "", state.id))
+                }
+                Error(_) -> {
+                  io.println(
+                    "Actor "
+                    <> int.to_string(state.id)
+                    <> " (passive) failed to select neighbor",
+                  )
+                }
+              }
+              actor.continue(state)
             }
           }
-
-          let updated =
-            ActorState(..state, times_heard: new_times, seen_ids: new_seen_ids)
-
+        }
+        False -> {
+          let was_first = state.times_heard == 0 && !state.has_forwarded
+          let new_has_forwarded = case was_first {
+            True -> {
+              forward_to_peers(state.id, state.peers, msg_id)
+              True
+            }
+            False -> state.has_forwarded
+          }
+          let new_times = state.times_heard + 1
+          case state.peers {
+            [] -> {
+              io.println(
+                "Actor " <> int.to_string(state.id) <> " has no peers!",
+              )
+            }
+            peers -> {
+              let neighbor_index = int.random(list.length(peers))
+              let selected_peer = get_peer_at_index(peers, neighbor_index)
+              case selected_peer {
+                Ok(Peer(_neighbor_id, subject)) -> {
+                  process.send(subject, Gossip(msg_id, "", state.id))
+                }
+                Error(_) -> {
+                  io.println(
+                    "Actor "
+                    <> int.to_string(state.id)
+                    <> " failed to select neighbor",
+                  )
+                }
+              }
+            }
+          }
+          let updated_state =
+            ActorState(
+              ..state,
+              times_heard: new_times,
+              has_forwarded: new_has_forwarded,
+            )
           case new_times >= 3 {
             True -> {
-              io.println(
-                "Actor "
-                <> int.to_string(state.id)
-                <> " heard rumor 3 times, stopping.",
-              )
-              // Notify coordinator of completion
               case state.coordinator {
                 option.Some(coord_subject) -> {
                   process.send(coord_subject, ActorCompleted(state.id))
                 }
                 option.None -> Nil
               }
-              actor.stop()
+              actor.continue(ActorState(..updated_state, converged: True))
             }
-            False -> actor.continue(updated)
+            False -> actor.continue(updated_state)
           }
         }
       }
     }
-
-    ActorCompleted(_) -> actor.continue(state)
-    // Ignore completion messages in actors
-    AllDone -> actor.continue(state)
 
     PushSum(received_s, received_w) -> {
-  case state.converged {
-    True -> {
-      // Passive mode: forward entire received to random neighbor
-      case state.peers {
-        [] -> {
-          io.println("Actor " <> int.to_string(state.id) <> " (passive) has no peers to forward to!")
-          actor.continue(state)
-        }
-        peers -> {
-          let neighbor_index = int.random(list.length(peers))
-          let selected_peer = get_peer_at_index(peers, neighbor_index)
-          case selected_peer {
-            Ok(Peer(neighbor_id, subject)) -> {
-              io.println(
-                "Actor "
-                <> int.to_string(state.id)
-                <> " (passive) forwarding ("
-                <> float.to_string(received_s)
-                <> ", "
-                <> float.to_string(received_w)
-                <> ") to neighbor "
-                <> int.to_string(neighbor_id),
-              )
-              process.send(subject, PushSum(received_s, received_w))
-            }
-            Error(_) -> {
-              io.println("Actor " <> int.to_string(state.id) <> " (passive) failed to select neighbor")
-            }
-          }
-          actor.continue(state)
-        }
-      }
-    }
-    False -> {
-      // Active mode: add received, update, check termination
-      let new_s = state.s +. received_s
-      let new_w = state.w +. received_w
-      let current_ratio = new_s /. new_w
-
-      let new_ratios = case list.length(state.last_ratios) >= 3 {
-        True -> list.drop(state.last_ratios, 1) |> list.append([current_ratio])
-        False -> list.append(state.last_ratios, [current_ratio])
-      }
-
-      let updated_state = ActorState(..state, s: new_s, w: new_w, last_ratios: new_ratios)
-
-      case should_terminate_pushsum(new_ratios) {
+      case state.converged {
         True -> {
-          io.println(
-            "Actor "
-            <> int.to_string(state.id)
-            <> " converging push-sum. Final ratio: "
-            <> float.to_string(current_ratio),
-          )
-          // Notify coordinator
-          case state.coordinator {
-            option.Some(coord_subject) -> process.send(coord_subject, ActorCompleted(state.id))
-            option.None -> Nil
-          }
-          // Offload full current mass to random neighbor
           case state.peers {
             [] -> {
-              io.println("Actor " <> int.to_string(state.id) <> " has no peers to offload to!")
-              actor.continue(ActorState(..updated_state, converged: True, s: 0.0, w: 0.0, last_ratios: []))
+              actor.continue(state)
             }
             peers -> {
               let neighbor_index = int.random(list.length(peers))
               let selected_peer = get_peer_at_index(peers, neighbor_index)
               case selected_peer {
-                Ok(Peer(neighbor_id, subject)) -> {
+                Ok(Peer(_neighbor_id, subject)) -> {
+                  process.send(subject, PushSum(received_s, received_w))
+                }
+                Error(_) -> {
                   io.println(
                     "Actor "
                     <> int.to_string(state.id)
-                    <> " offloading full ("
-                    <> float.to_string(new_s)
-                    <> ", "
-                    <> float.to_string(new_w)
-                    <> ") to neighbor "
-                    <> int.to_string(neighbor_id),
+                    <> " (passive) failed to select neighbor",
                   )
-                  process.send(subject, PushSum(new_s, new_w))
-                }
-                Error(_) -> {
-                  io.println("Actor " <> int.to_string(state.id) <> " failed to select neighbor for offload")
                 }
               }
-              // Become passive with zero mass
-              actor.continue(ActorState(..updated_state, converged: True, s: 0.0, w: 0.0, last_ratios: []))
+              actor.continue(state)
             }
           }
         }
         False -> {
-          // Normal: send half, keep half
-          let half_s = new_s /. 2.0
-          let half_w = new_w /. 2.0
-          let final_s = new_s -. half_s
-          let final_w = new_w -. half_w
+          let new_s = state.s +. received_s
+          let new_w = state.w +. received_w
+          let current_ratio = new_s /. new_w
 
-          let final_state = ActorState(..updated_state, s: final_s, w: final_w)
+          let new_ratios = case list.length(state.last_ratios) >= 3 {
+            True ->
+              list.drop(state.last_ratios, 1) |> list.append([current_ratio])
+            False -> list.append(state.last_ratios, [current_ratio])
+          }
 
-          case state.peers {
-            [] -> {
-              io.println("Actor " <> int.to_string(state.id) <> " has no peers!")
-              actor.continue(final_state)
-            }
-            peers -> {
-              let neighbor_index = int.random(list.length(peers))
-              let selected_peer = get_peer_at_index(peers, neighbor_index)
-              case selected_peer {
-                Ok(Peer(neighbor_id, subject)) -> {
-                  io.println(
-                    "Actor "
-                    <> int.to_string(state.id)
-                    <> " sending ("
-                    <> float.to_string(half_s)
-                    <> ", "
-                    <> float.to_string(half_w)
-                    <> ") to neighbor "
-                    <> int.to_string(neighbor_id),
+          let updated_state =
+            ActorState(..state, s: new_s, w: new_w, last_ratios: new_ratios)
+
+          case should_terminate_pushsum(new_ratios) {
+            True -> {
+              case state.coordinator {
+                option.Some(coord_subject) ->
+                  process.send(coord_subject, ActorCompleted(state.id))
+                option.None -> Nil
+              }
+              case state.peers {
+                [] -> {
+                  actor.continue(
+                    ActorState(
+                      ..updated_state,
+                      converged: True,
+                      s: 0.0,
+                      w: 0.0,
+                      last_ratios: [],
+                    ),
                   )
-                  process.send(subject, PushSum(half_s, half_w))
                 }
-                Error(_) -> {
-                  io.println("Actor " <> int.to_string(state.id) <> " failed to select neighbor")
+                peers -> {
+                  let neighbor_index = int.random(list.length(peers))
+                  let selected_peer = get_peer_at_index(peers, neighbor_index)
+                  case selected_peer {
+                    Ok(Peer(_neighbor_id, subject)) -> {
+                      process.send(subject, PushSum(new_s, new_w))
+                    }
+                    Error(_) -> {
+                      io.println(
+                        "Actor "
+                        <> int.to_string(state.id)
+                        <> " failed to select neighbor for offload",
+                      )
+                    }
+                  }
+                  actor.continue(
+                    ActorState(
+                      ..updated_state,
+                      converged: True,
+                      s: 0.0,
+                      w: 0.0,
+                      last_ratios: [],
+                    ),
+                  )
                 }
               }
-              actor.continue(final_state)
+            }
+            False -> {
+              // Normal: send half, keep half
+              let half_s = new_s /. 2.0
+              let half_w = new_w /. 2.0
+              let final_s = new_s -. half_s
+              let final_w = new_w -. half_w
+
+              let final_state =
+                ActorState(..updated_state, s: final_s, w: final_w)
+
+              case state.peers {
+                [] -> {
+                  io.println(
+                    "Actor " <> int.to_string(state.id) <> " has no peers!",
+                  )
+                  actor.continue(final_state)
+                }
+                peers -> {
+                  let neighbor_index = int.random(list.length(peers))
+                  let selected_peer = get_peer_at_index(peers, neighbor_index)
+                  case selected_peer {
+                    Ok(Peer(_neighbor_id, subject)) -> {
+                      process.send(subject, PushSum(half_s, half_w))
+                    }
+                    Error(_) -> {
+                      io.println(
+                        "Actor "
+                        <> int.to_string(state.id)
+                        <> " failed to select neighbor",
+                      )
+                    }
+                  }
+                  actor.continue(final_state)
+                }
+              }
             }
           }
         }
       }
     }
-  }
-}
-  }
-}
 
-// ===== Helper functions =====
-
-// Simple list membership check
-fn contains(list: List(String), value: String) -> Bool {
-  case list {
-    [] -> False
-    [head, ..tail] -> head == value || contains(tail, value)
+    AllDone -> actor.stop()
+    ActorCompleted(_) -> actor.continue(state)
   }
 }
 
-// Check if push-sum should terminate based on ratio stability
+// Check if push-sum should terminate based on ratio stability over 3 rounds
 fn should_terminate_pushsum(ratios: List(Float)) -> Bool {
   case list.length(ratios) >= 3 {
     True -> {
       case ratios {
         [r1, r2, r3, ..] -> {
-          // Check if the ratio hasn't changed by more than 10^-10 over 3 consecutive rounds
           let diff1 = float.absolute_value(r1 -. r2)
           let diff2 = float.absolute_value(r2 -. r3)
           let should_terminate = diff1 <. 0.0000000001 && diff2 <. 0.0000000001
-
-          io.println(
-            "Termination check: r1="
-            <> float.to_string(r1)
-            <> ", r2="
-            <> float.to_string(r2)
-            <> ", r3="
-            <> float.to_string(r3)
-            <> ", diff1="
-            <> float.to_string(diff1)
-            <> ", diff2="
-            <> float.to_string(diff2)
-            <> ", terminate="
-            <> bool.to_string(should_terminate),
-          )
-
           should_terminate
         }
         _ -> False
@@ -498,7 +466,6 @@ fn get_peer_at_index(peers: List(Peer), index: Int) -> Result(Peer, Nil) {
   }
 }
 
-// Forward to all peers except self
 fn forward_to_peers(self_id: Int, peers: List(Peer), msg_id: String) -> Nil {
   let _ =
     peers
@@ -513,8 +480,7 @@ fn forward_to_peers(self_id: Int, peers: List(Peer), msg_id: String) -> Nil {
   Nil
 }
 
-// ===== Topology creation (now supports multiple topologies) =====
-
+// Build neighbor lists per actor, depending on the topology
 pub fn initialize_topology(
   n: Int,
   topology: String,
@@ -528,7 +494,6 @@ pub fn initialize_topology(
     True -> {
       let subjects_with_ids = create_actors(n, 0, [], algorithm)
 
-      // Build neighbor lists per actor, depending on the topology
       let neighbor_lists = case topology {
         "full" -> build_full(subjects_with_ids)
         "line" -> build_line(subjects_with_ids)
@@ -542,22 +507,13 @@ pub fn initialize_topology(
         }
       }
 
-      // Send neighbors to each actor
       let _ =
         neighbor_lists
         |> list.each(fn(entry) {
-          // entry: (id, subject, neighbors)
-          let TopoEntry(id, subject, neighbors) = entry
-          io.println(
-            "Assigning "
-            <> int.to_string(list.length(neighbors))
-            <> " neighbors to actor "
-            <> int.to_string(id),
-          )
+          let TopoEntry(_id, subject, neighbors) = entry
           process.send(subject, SetupPeers(neighbors))
         })
 
-      // Return subjects list for seeding
       let subjects =
         subjects_with_ids
         |> list.map(fn(peer) {
@@ -570,7 +526,6 @@ pub fn initialize_topology(
   }
 }
 
-// Spawn actors and return Peer(id, subject)
 fn create_actors(
   remaining: Int,
   next_id: Int,
@@ -585,13 +540,13 @@ fn create_actors(
           id: next_id,
           times_heard: 0,
           peers: [],
-          seen_ids: [],
           coordinator: option.None,
           algorithm: algorithm,
-          s: int.to_float(next_id + 1),  // Optional: start IDs from 1 to n for standard sum/avg; avoids s=0.0 for actor 0
+          s: int.to_float(next_id + 1),
           w: 1.0,
           last_ratios: [],
-          converged: False,  // Initialize
+          converged: False,
+          has_forwarded: False,
         )
 
       let assert Ok(started) =
@@ -599,22 +554,18 @@ fn create_actors(
         |> actor.on_message(actor_handler)
         |> actor.start
 
-      io.println("Actor " <> int.to_string(next_id) <> " created")
-
       let peer = Peer(next_id, started.data)
       create_actors(remaining - 1, next_id + 1, [peer, ..acc], algorithm)
     }
   }
 }
 
-// A compact struct to carry (id, subject, neighbors) while configuring topology
 type TopoEntry {
   TopoEntry(Int, process.Subject(Message), List(Peer))
 }
 
-// ===== Topology builders =====
+// Each of these functions are used to build a topology given in the project spec
 
-// FULL: everyone else is a neighbor
 fn build_full(nodes: List(Peer)) -> List(TopoEntry) {
   nodes
   |> list.map(fn(node) {
@@ -629,7 +580,6 @@ fn build_full(nodes: List(Peer)) -> List(TopoEntry) {
   })
 }
 
-// LINE: i has neighbors i-1 and i+1 (bounds-checked)
 fn build_line(nodes: List(Peer)) -> List(TopoEntry) {
   let total = list.length(nodes)
 
@@ -639,7 +589,6 @@ fn build_line(nodes: List(Peer)) -> List(TopoEntry) {
     let left = id - 1
     let right = id + 1
 
-    // Multiple subjects in case expression
     let neighbors_ids = case left >= 0, right < total {
       True, True -> [left, right]
       True, False -> [left]
@@ -652,11 +601,9 @@ fn build_line(nodes: List(Peer)) -> List(TopoEntry) {
   })
 }
 
-// GRID3D: 6-neighborhood in a LxLxL grid; we only use first n cells
 fn build_grid3d(nodes: List(Peer), n: Int) -> List(TopoEntry) {
   let l = cube_side_for(n)
 
-  // Map id -> (x,y,z) within L^3
   nodes
   |> list.map(fn(node) {
     let Peer(id, subject) = node
@@ -664,42 +611,51 @@ fn build_grid3d(nodes: List(Peer), n: Int) -> List(TopoEntry) {
     let neighbor_ids =
       six_neighbors(coords, l)
       |> list.filter(fn(idx) { idx < n })
-    // ignore cells beyond n
     let neighbors = neighbors_by_ids(nodes, neighbor_ids)
     TopoEntry(id, subject, neighbors)
   })
 }
 
-// IMPERFECT3D: grid3d + 1 extra deterministic neighbor not already present
 fn build_imperfect3d(nodes: List(Peer), n: Int) -> List(TopoEntry) {
   let base = build_grid3d(nodes, n)
 
   base
   |> list.map(fn(entry) {
     let TopoEntry(id, subject, neighbors) = entry
-    // deterministic pseudo-random pick: (a * id + b) mod n
-    let pick0 = { id * 1_103_515_245 + 12_345 } |> abs_mod(n)
-    let pick1 = { pick0 + 1 } |> abs_mod(n)
-    let pick = pick_non_conflicting(id, [pick0, pick1], neighbors)
-
-    let extra = case pick {
-      Ok(pid) -> {
-        case peer_by_id(nodes, pid) {
-          Ok(p) -> [p]
+    let neighbor_ids =
+      list.map(neighbors, fn(p) {
+        let Peer(nid, _) = p
+        nid
+      })
+    let candidates =
+      list.filter_map(nodes, fn(p) {
+        let Peer(pid, _) = p
+        case pid != id && !list.contains(neighbor_ids, pid) {
+          True -> Ok(pid)
+          False -> Error(Nil)
+        }
+      })
+    let extra = case candidates {
+      [] -> []
+      cands -> {
+        let shuffled = list.shuffle(cands)
+        case list.first(shuffled) {
+          Ok(pid) ->
+            case peer_by_id(nodes, pid) {
+              Ok(p) -> [p]
+              Error(_) -> []
+            }
           Error(_) -> []
         }
       }
-      Error(_) -> []
     }
-
     let neighbors2 = list.append(neighbors, extra)
     TopoEntry(id, subject, neighbors2)
   })
 }
 
-// ===== Neighbor math helpers =====
+// All below are helper functions to assign neighbors when topology is created
 
-// Find a peer by id in a small list
 fn peer_by_id(nodes: List(Peer), id: Int) -> Result(Peer, Nil) {
   case nodes {
     [] -> Error(Nil)
@@ -720,12 +676,10 @@ fn neighbors_by_ids(nodes: List(Peer), ids: List(Int)) -> List(Peer) {
       case peer_by_id(nodes, i) {
         Ok(p) -> [p, ..neighbors_by_ids(nodes, rest)]
         Error(_) -> neighbors_by_ids(nodes, rest)
-        // skip invalid
       }
   }
 }
 
-// Convert id -> (x,y,z) for side L
 fn id_to_coords(id: Int, l: Int) -> #(Int, Int, Int) {
   let x = id % l
   let y = { id / l } % l
@@ -733,12 +687,10 @@ fn id_to_coords(id: Int, l: Int) -> #(Int, Int, Int) {
   #(x, y, z)
 }
 
-// Convert (x,y,z) -> id
 fn coords_to_id(x: Int, y: Int, z: Int, l: Int) -> Int {
   x + y * l + z * l * l
 }
 
-// Return the six neighbor indices inside the LxLxL box (no n limit here)
 fn six_neighbors(coords: #(Int, Int, Int), l: Int) -> List(Int) {
   let #(x, y, z) = coords
 
@@ -762,65 +714,13 @@ fn six_neighbors(coords: #(Int, Int, Int), l: Int) -> List(Int) {
   })
 }
 
-// Choose L such that L^3 >= n and (L-1)^3 < n
 fn cube_side_for(n: Int) -> Int {
-  let mut = cube_side_loop(1, n)
-  mut
+  cube_side_loop(1, n)
 }
 
 fn cube_side_loop(l: Int, n: Int) -> Int {
   case l * l * l >= n {
     True -> l
     False -> cube_side_loop(l + 1, n)
-  }
-}
-
-fn abs_mod(x: Int, m: Int) -> Int {
-  let r = x % m
-  case r < 0 {
-    True -> r + m
-    False -> r
-  }
-}
-
-// Ensure extra neighbor is not self nor already a neighbor; try candidates in order
-fn pick_non_conflicting(
-  self_id: Int,
-  candidates: List(Int),
-  neighbors: List(Peer),
-) -> Result(Int, Nil) {
-  case candidates {
-    [] -> Error(Nil)
-    [cand, ..rest] -> {
-      case cand == self_id || peer_id_in_list(neighbors, cand) {
-        True -> pick_non_conflicting(self_id, rest, neighbors)
-        False -> Ok(cand)
-      }
-    }
-  }
-}
-
-fn peer_id_in_list(neighbors: List(Peer), target_id: Int) -> Bool {
-  case neighbors {
-    [] -> False
-    [Peer(hid, _), ..tail] ->
-      hid == target_id || peer_id_in_list(tail, target_id)
-  }
-}
-
-// ===== Wait for completion =====
-
-fn wait_for_completion(main_subject: process.Subject(Message)) -> Nil {
-  // This will block until the coordinator sends us a message
-  let message = process.receive_forever(main_subject)
-  case message {
-    AllDone -> {
-      io.println("Received completion signal from coordinator.")
-      Nil
-    }
-    _ -> {
-      io.println("Unexpected message received.")
-      Nil
-    }
   }
 }
