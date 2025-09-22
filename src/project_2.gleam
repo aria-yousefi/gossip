@@ -25,34 +25,42 @@ pub fn main() -> Nil {
   let default_n = 20
   let default_algorithm = "gossip"
 
+  // N is arg #1; accept any tail
   let n = case args {
-    [n_str, _t, _alg] -> {
+    [n_str, ..] ->
       case int.parse(n_str) {
         Ok(v) -> v
         Error(_) -> default_n
       }
-    }
-    [n_str, _t] -> {
-      case int.parse(n_str) {
-        Ok(v) -> v
-        Error(_) -> default_n
-      }
-    }
     _ -> default_n
   }
 
+  // Topology is arg #2; accept any tail
   let top_str = case args {
-    [_n, t, _alg] -> t
-    [_n, t] -> t
-    [t] -> t
+    [_n, t, ..] -> t
     _ -> default_top
   }
 
-
+  // Algorithm is arg #3; accept any tail
   let algorithm_str = case args {
-    [_n, _t,  alg] -> alg
+    [_n, _t, alg, ..] -> alg
     _ -> default_algorithm
   }
+
+  // Optional arg #4 = trial; accept any tail
+  let trial = case args {
+    [_n, _t, _alg, trial_str, ..] ->
+      case int.parse(trial_str) {
+        Ok(v) -> v
+        Error(_) -> 1
+      }
+    _ -> 1
+  }
+
+  // Flags can appear anywhere
+  let csv_mode = list.any(args, fn(a) { a == "csv" })
+  // If you added quiet guards in prints, you can parse it too:
+  // let quiet = list.any(args, fn(a) { a == "quiet" })
 
   let algorithm = case algorithm_str {
     "push-sum" -> PushSumAlgorithm
@@ -83,37 +91,57 @@ pub fn main() -> Nil {
           process.send(subject, CoordinatorReady(coordinator.data))
         })
 
-      // Start the algorithm execution for Gossip or PushSum
+      // Seed the chosen algorithm
       case subjects {
         [seed_subject, ..] -> {
           case algorithm {
-            GossipAlgorithm -> {
-              let _ =
-                process.send(
-                  seed_subject,
-                  Gossip("rumor-1", "Here's a rumor!", -1),
-                )
-            }
-            PushSumAlgorithm -> {
-              let _ = process.send(seed_subject, PushSum(1.0, 1.0))
-            }
+            GossipAlgorithm ->
+              process.send(
+                seed_subject,
+                Gossip("rumor-1", "Here's a rumor!", -1),
+              )
+            PushSumAlgorithm -> process.send(seed_subject, PushSum(1.0, 1.0))
           }
 
+          // Block until the coordinator reports completion
           wait_for_completion(main_subject)
+
+          // Measure convergence time
           let end_actual_time = wall_time_ms()
           let actual_delta = end_actual_time - start_actual_time
-          io.println(
-            "Convergence completed in: " <> int.to_string(actual_delta) <> "ms",
-          )
+
+          // CSV-mode vs human-friendly print
+          case csv_mode {
+            True ->
+              io.println(
+                "RESULT,algorithm="
+                <> algorithm_str
+                <> ",topology="
+                <> top_str
+                <> ",n="
+                <> int.to_string(n)
+                <> ",trial="
+                <> int.to_string(trial)
+                <> ",convergence_ms="
+                <> int.to_string(actual_delta),
+              )
+            False ->
+              io.println(
+                "Convergence completed in: "
+                <> int.to_string(actual_delta)
+                <> "ms",
+              )
+          }
         }
         [] -> io.println("No seed found!")
       }
     }
-    Error(_) -> {
+
+    Error(_) ->
       io.println(
-        "Failed to initialize topology!\n\nUsage: gleam run <full|line|grid3d|imperfect3d> <n> <gossip|push-sum>",
+        "Failed to initialize topology!\n\n"
+        <> "Usage: gleam run <n> <full|line|grid3d|imperfect3d> <gossip|push-sum> <trial?> [csv] [quiet]",
       )
-    }
   }
 }
 
