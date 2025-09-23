@@ -19,7 +19,7 @@ The following are the algorithms supported by the program:
 
 Where:
 - numNodes is the number of actors involved
-- topology is one of: full, 3D, line, or imp3D.
+- topology is one of: full, line, grid3d, or imperfect3d.
 - algorithm is one of: gossip, push-sum.
 
 Example usage: ``gleam run 1000 full push-sum``
@@ -33,4 +33,11 @@ Example output:
 ``Convergence completed in: 1361ms``
 
 ### 4. Upper limit and performance for each topology-algorithm combination
-
+- Full Gossip: 6000 nodes - 41462ms
+- Full Push-Sum: 6000 nodes - 45898ms
+- Line Gossip: 20000 nodes - 299402ms
+- Line Push-Sum: 15000 nodes - 91577ms
+- 3D Grid Gossip: 20000 nodes - 146531ms
+- 3D Grid Push-Sum: 15000 nodes - 215327ms
+- Imperfect 3D Grid Gossip: 20000 nodes - 176885ms
+- Imperfect 3D Grid Push-Sum: 20000 nodes - 13675ms
